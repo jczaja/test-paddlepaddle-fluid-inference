@@ -289,13 +289,16 @@ int main(int argc, char** argv) {
   paddle::framework::LoDTensor input;
   srand(time(0));
   float* input_ptr =
-      input.mutable_data<float>({1, 3*224*224}, paddle::platform::CPUPlace());
+      input.mutable_data<float>({1, 3,224,224}, paddle::platform::CPUPlace());
+      //input.mutable_data<float>({1, 784}, paddle::platform::CPUPlace());
   for (int i = 0; i < 3*224*224; ++i) {
+  //for (int i = 0; i < 784; ++i) {
     input_ptr[i] = rand() / (static_cast<float>(RAND_MAX));
   }
 
   std::vector<paddle::framework::LoDTensor> feeds;
   feeds.push_back(input);
+  //feeds.push_back(input_label);
   std::vector<paddle::framework::LoDTensor> fetchs;
 
   // Set up maps for feed and fetch targets
@@ -327,7 +330,7 @@ int main(int argc, char** argv) {
     std::cout << "result:";
     float* output_ptr = fetchs[i].data<float>();
     for (int j = 0; j < paddle::framework::product(dims_i); ++j) {
-      std::cout << " " << output_ptr[j];
+      std::cout << " " << output_ptr[j] << std::endl;
     }
     std::cout << std::endl;
   }
