@@ -218,7 +218,7 @@ int main(int argc, char** argv) {
   }
   auto t2 = __rdtsc();
 
-  std::cout << "---> " << "Inference" << " on average takes " << (t2 -t1)*1000.0f/((float)pi.tsc*FLAGS_iterations) << " ms" << " Throughput: " << shape[0]/((t2 -t1)/((float)pi.tsc*FLAGS_iterations)) << " Images/sec";
+  std::cout << std::endl << "---> " << "Inference" << " on average takes " << (t2 -t1)*1000.0f/((float)pi.tsc*FLAGS_iterations) << " ms" << " Throughput: " << shape[0]/((t2 -t1)/((float)pi.tsc*FLAGS_iterations)) << " Images/sec";
 
   std::cout << std::endl;
 
