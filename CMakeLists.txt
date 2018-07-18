@@ -16,7 +16,7 @@ endif()
 
 message("PADDLEROOT: $ENV{PADDLEROOT}")
 # ---[ Find include dir
-find_path(PADDLE_INCLUDE_DIR NAMES "paddle/fluid/inference/io.h" HINTS "$ENV{PADDLEROOT}" PATHS "$ENV{PADDLEROOT}" )
+find_path(PADDLE_INCLUDE_DIR NAMES "paddle/fluid/inference/paddle_inference_api.h" HINTS "$ENV{PADDLEROOT}" PATHS "$ENV{PADDLEROOT}" )
 
 message("PADDLE_INCLUDE: ${PADDLE_INCLUDE_DIR}")
 
@@ -34,14 +34,14 @@ else()
   message(FATAL " Intel PADDLE not located properly")
 endif()
 
+find_library(PADDLE_INFERENCE_LIBRARY
+        NAMES paddle_inference_api
+        PATHS $ENV{PADDLEROOT}/paddle/fluid/inference)
+
 # protobuf version has to match among paddle that generates it and inference program that loads protobuf
 include_directories($ENV{PADDLEROOT}/third_party/install/protobuf/include)
+include_directories("$ENV{PADDLEROOT}/third_party/install/gflags/include")
 
-# GFLAGS
-find_library(GFLAGS_LIB NAMES gflags)
-find_path(GFLAGS_INCLUDES NAMES gflags.h PATHS /usr/include/gflags/)
-message("GFLAGS INCLUDES: ${GFLAGS_INCLUDES}")
-include_directories(SYSTEM ${GFLAGS_INCLUDES})
 
 #OpenCV
 find_package( OpenCV REQUIRED )
@@ -58,8 +58,9 @@ add_definitions(-Wall)
 
 target_link_libraries(test-paddle-fluid
 ${PADDLE_LIBRARY}
+${PADDLE_INFERENCE_LIBRARY}
 ${OpenCV_LIBS}
-${GFLAGS_LIB}
 $ENV{PADDLEROOT}/third_party/install/mklml/lib/libmklml_intel.so
 $ENV{PADDLEROOT}/third_party/install/protobuf/lib/libprotobuf.a
+$ENV{PADDLEROOT}/third_party/install/gflags/lib/libgflags.a
 )

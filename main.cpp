@@ -2,337 +2,228 @@
 #include <time.h>
 #include <iostream>
 #include <memory>
+#include <x86intrin.h>
 #include "gflags/gflags.h"
-//#include "paddle/fluid/framework/init.h"
-#include "paddle/fluid/platform/init.h"
-#include "paddle/fluid/framework/lod_tensor.h"
-#include "paddle/fluid/inference/io.h"
-
-DEFINE_string(modeldir, "", "Directory of the inference model.");
-
-/*
-#include <opencv2/opencv.hpp>
-#include <time.h>
-#include <cstring>
-#include <vector>
+#include "paddle/fluid/inference/paddle_inference_api.h"
 #include <string>
 #include <fstream>
 #include <streambuf>
 #include <sstream>
+#include <iomanip>
+#include <unistd.h>
+#include <sys/types.h>
+
+DEFINE_string(modeldir, "", "Directory of the inference model.");
+DEFINE_int32(batch_size, 1, "Size of Batch of images to be processed");
+DEFINE_int32(channels, 3, "Number of channels");
+DEFINE_int32(height, 224, "Height of image");
+DEFINE_int32(width, 224, "Width of Image");
+DEFINE_int32(iterations, 1, "Number of Iterations (executions of Batches) to perform");
+DEFINE_int32(fmaspc, 0,
+    "Number of mul and add instructions that can be done within one cycle of CPU's core. Default(0) is guess value based on /proc/cpuinfo");
+
+struct platform_info
+{
+    long num_logical_processors;
+    long num_physical_processors_per_socket;
+    long num_hw_threads_per_socket;
+    unsigned int num_ht_threads; 
+    unsigned int num_total_phys_cores;
+    unsigned long long tsc;
+    unsigned long long max_bandwidth; 
+};
+
+class nn_hardware_platform
+{
+    public:
+        nn_hardware_platform() : m_num_logical_processors(0), m_num_physical_processors_per_socket(0), m_num_hw_threads_per_socket(0) ,m_num_ht_threads(1), m_num_total_phys_cores(1), m_tsc(0), m_fmaspc(0), m_max_bandwidth(0)
+        {
+#ifdef __linux__
+            m_num_logical_processors = sysconf(_SC_NPROCESSORS_ONLN);
+        
+            m_num_physical_processors_per_socket = 0;
+
+            std::ifstream ifs;
+            ifs.open("/proc/cpuinfo"); 
+
+            // If there is no /proc/cpuinfo fallback to default scheduler
+            if(ifs.good() == false) {
+                m_num_physical_processors_per_socket = m_num_logical_processors;
+                assert(0);  // No cpuinfo? investigate that
+                return;   
+            }
+            std::string cpuinfo_content((std::istreambuf_iterator<char>(ifs)), std::istreambuf_iterator<char>());
+            std::stringstream cpuinfo_stream(cpuinfo_content);
+            std::string cpuinfo_line;
+            std::string cpu_name;
+            while(std::getline(cpuinfo_stream,cpuinfo_line,'\n')){
+                if((m_num_physical_processors_per_socket == 0) && (cpuinfo_line.find("cpu cores") != std::string::npos)) {
+                    // convert std::string into number eg. skip colon and after it in the same line  should be number of physical cores per socket
+                    std::stringstream( cpuinfo_line.substr(cpuinfo_line.find(":") + 1) ) >> m_num_physical_processors_per_socket; 
+                }
+                if(cpuinfo_line.find("siblings") != std::string::npos) {
+                    // convert std::string into number eg. skip colon and after it in the same line  should be number of HW threads per socket
+                    std::stringstream( cpuinfo_line.substr(cpuinfo_line.find(":") + 1) ) >> m_num_hw_threads_per_socket; 
+                }
+
+                if(cpuinfo_line.find("model") != std::string::npos) {
+                    cpu_name = cpuinfo_line;
+                    // convert std::string into number eg. skip colon and after it in the same line  should be number of HW threads per socket
+                    float ghz_tsc = 0.0f;
+                    std::stringstream( cpuinfo_line.substr(cpuinfo_line.find("@") + 1) ) >> ghz_tsc; 
+                    m_tsc = static_cast<unsigned long long>(ghz_tsc*1000000000.0f);
+                    
+                    // Maximal bandwidth is Xeon 68GB/s , Brix 25.8GB/s
+                    if(cpuinfo_line.find("Xeon") != std::string::npos) {
+                      m_max_bandwidth = 68000;  //68 GB/s      -- XEONE5
+                    } 
+                    
+                    if(cpuinfo_line.find("i7-4770R") != std::string::npos) {
+                      m_max_bandwidth = 25800;  //25.68 GB/s      -- BRIX
+                    } 
+                }
+                
+                // determine instruction set (AVX, AVX2, AVX512)
+                if(m_fmaspc == 0) {
+                  if(FLAGS_fmaspc != 0) {
+                    m_fmaspc = FLAGS_fmaspc;
+                  } else {
+                    if (cpuinfo_line.find(" avx") != std::string::npos) {
+                      m_fmaspc = 8;   // On AVX instruction set we have one FMA unit , width of registers is 256bits, so we can do 8 muls and adds on floats per cycle
+                      if (cpuinfo_line.find(" avx2") != std::string::npos) {
+                        m_fmaspc = 16;   // With AVX2 instruction set we have two FMA unit , width of registers is 256bits, so we can do 16 muls and adds on floats per cycle
+                      }
+                      if (cpuinfo_line.find(" avx512") != std::string::npos) {
+                        m_fmaspc = 32;   // With AVX512 instruction set we have two FMA unit , width of registers is 512bits, so we can do 32 muls and adds on floats per cycle
+                      }
+
+                    } 
+                  }
+                }
+            }
+            // If no FMA ops / cycle was given/found then raise a concern
+            if(m_fmaspc == 0) {
+              throw std::string("No AVX instruction set found. Please use \"--fmaspc\" to specify\n");
+            }
+
+            // There is cpuinfo, but parsing did not get quite right? Investigate it
+            assert( m_num_physical_processors_per_socket > 0);
+            assert( m_num_hw_threads_per_socket > 0);
+
+            // Calculate how many threads can be run on single cpu core , in case of lack of hw info attributes assume 1
+            m_num_ht_threads =  m_num_physical_processors_per_socket != 0 ? m_num_hw_threads_per_socket/ m_num_physical_processors_per_socket : 1;
+            // calculate total number of physical cores eg. how many full Hw threads we can run in parallel
+            m_num_total_phys_cores = m_num_hw_threads_per_socket != 0 ? m_num_logical_processors / m_num_hw_threads_per_socket * m_num_physical_processors_per_socket : 1;
+
+            std::cout << "Platform:" << std::endl << "  " << cpu_name << std::endl 
+                      << "  number of physical cores: " << m_num_total_phys_cores << std::endl; 
+
+            ifs.close(); 
+
+#endif
+        }
+    // Function computing percentage of theretical efficiency of HW capabilities
+    float compute_theoretical_efficiency(unsigned long long start_time, unsigned long long end_time, unsigned long long num_fmas)
+    {
+      // Num theoretical operations
+      // Time given is there
+      return 100.0*num_fmas/((float)(m_num_total_phys_cores*m_fmaspc))/((float)(end_time - start_time));
+    }
+
+    void get_platform_info(platform_info& pi)
+    {
+       pi.num_logical_processors = m_num_logical_processors; 
+       pi.num_physical_processors_per_socket = m_num_physical_processors_per_socket; 
+       pi.num_hw_threads_per_socket = m_num_hw_threads_per_socket;
+       pi.num_ht_threads = m_num_ht_threads;
+       pi.num_total_phys_cores = m_num_total_phys_cores;
+       pi.tsc = m_tsc;
+       pi.max_bandwidth = m_max_bandwidth;
+    }
+    private:
+        long m_num_logical_processors;
+        long m_num_physical_processors_per_socket;
+        long m_num_hw_threads_per_socket;
+        unsigned int m_num_ht_threads;
+        unsigned int m_num_total_phys_cores;
+        unsigned long long m_tsc;
+        short int m_fmaspc;
+        unsigned long long m_max_bandwidth;
+};
 
 
-#include "common/common.h"
-
-int input_width = 0;
-int input_height = 0;
-int input_num_channels = 0;
-*/
-//void makeIncrementalData(paddle_matrix& mat)
-//{
- // paddle_real* array;
-//  int num = 1;
-//  mat = paddle_matrix_create(/* sample_num */ num,
-//                                         /* size */input_width*input_height*input_num_channels,
-//                                         /* useGPU */ false);
-//  // Get First row.
-//  CHECK(paddle_matrix_get_row(mat, 0, &array));
-//
-//  for (int i = 0; i < input_width*input_height*input_num_channels; ++i) {
-//    array[i] = i;
-//  }
-//}
-
-//void makeRandomData(paddle_matrix& mat)
-//{
-//  paddle_real* array;
-//  int num = 1;
-//  mat = paddle_matrix_create(/* sample_num */ num,
-//                                         /* size */input_width*input_height*input_num_channels,
-//                                         /* useGPU */ false);
-//  // Get First row.
-//  CHECK(paddle_matrix_get_row(mat, 0, &array));
-//
-//  for (int i = 0; i < input_width*input_height*input_num_channels; ++i) {
-//    array[i] = rand() / ((float)RAND_MAX);
-//  }
-//}
-//
-//void makeFixedData(paddle_matrix& mat, paddle_real value)
-//{
-//  paddle_real* array;
-//  int num = 1;
-//  mat = paddle_matrix_create(/* sample_num */ num,
-//                                         /* size */input_width*input_height*input_num_channels,
-//                                         /* useGPU */ false);
-//  // Get First row.
-//  CHECK(paddle_matrix_get_row(mat, 0, &array));
-//
-//  for (int i = 0; i < input_width*input_height*input_num_channels; ++i) {
-//    array[i] = value;
-//  }
-//}
-//
-///* Wrap the input layer of the network in separate cv::Mat objects
-// * (one per channel). This way we save one memcpy 
-// * The last preprocessing operation will write the separate channels directly
-// * to the input layer. */
-//void wrapInputLayerBatch(paddle_matrix& mat, std::vector<std::vector<cv::Mat> >* input_channels_batch, int channels, int height, int width) {
-//
-//  // Create input matrix.
-//  int num = 1;
-//
-//  paddle_real* input_data;
-//  // Get First row.
-//  CHECK(paddle_matrix_get_row(mat, 0, &input_data));
-//
-//  for( int j = 0; j < num; ++j) {
-//      std::vector<cv::Mat> input_channels;
-//      for (int i = 0; i < channels; ++i) {
-//          cv::Mat channel(height,width, CV_32FC1, input_data);
-//          input_channels.push_back(channel);
-//          input_data += width * height;
-//      }
-//      input_channels_batch->push_back(input_channels);
-//  }
-//}
-//
-//cv::Mat load_mean_image(std::string mean_file)
-//{
-//
-//  std::ifstream ifs;
-//  ifs.open(mean_file);
-//
-//  if(ifs.good() == false) {
-//      std::cout << "Error reading image mean file" << std::endl;
-//      return cv::Mat();   
-//  }
-//
-//  std::vector<cv::Mat> channels;
-//  for (int c = 0; c < 3; ++c) {
-//    cv::Mat channel(256, 256, CV_32FC1);
-//    float parsedfloat;
-//    int i=0;
-//    while ( (ifs.eof() == false) && (i<256*256) )
-//    {
-//      ifs >> parsedfloat; 
-//      ((float*)channel.data)[i++] = parsedfloat;
-//    }
-//    channels.push_back(channel);
-//  }
-//
-//    /* Merge the separate channels into a single image. */
-//  cv::Mat mean;
-//  cv::merge(channels, mean);
-//
-//
-//  /* Compute the global mean pixel value and create a mean image
-//   * filled with this value. */
-//  cv::Scalar channel_mean = cv::mean(mean);
-//  return cv::Mat(cv::Size(input_width, input_height), mean.type(), channel_mean);
-//}
-//
-//void Preprocess(const cv::Mat& img,
-//                            std::vector<cv::Mat>* input_channels) {
-//  /* Convert the input image to the input image format of the network. */
-//  cv::Mat sample;
-//  if (img.channels() == 3 && input_num_channels == 1)
-//    cv::cvtColor(img, sample, cv::COLOR_BGR2GRAY);
-//  else if (img.channels() == 4 && input_num_channels == 1)
-//    cv::cvtColor(img, sample, cv::COLOR_BGRA2GRAY);
-//  else if (img.channels() == 4 && input_num_channels == 3)
-//    cv::cvtColor(img, sample, cv::COLOR_BGRA2BGR);
-//  else if (img.channels() == 1 && input_num_channels == 3)
-//    cv::cvtColor(img, sample, cv::COLOR_GRAY2BGR);
-//  else
-//    sample = img;
-//
-//  cv::Size input_geometry_(input_width, input_height);
-//
-//  cv::Mat sample_resized;
-//  if (sample.size() != input_geometry_)
-//    cv::resize(sample, sample_resized, input_geometry_);
-//  else
-//    sample_resized = sample;
-//
-//  cv::Mat sample_float;
-//  cv::Mat sample_normalized;
-//  if (input_num_channels == 3) {
-//    sample_resized.convertTo(sample_float, CV_32FC3);
-//    // Load image mean file
-//    cv::Mat mean, mean_resized;
-//    mean = load_mean_image("imagenet.mean");
-//    cv::resize(mean, mean_resized, input_geometry_); 
-//    cv::subtract(sample_float, mean_resized, sample_normalized);
-//    cv::split(sample_normalized, *input_channels);
-//  } else {
-//    sample_resized = sample_resized.reshape(1,1);
-//    sample_resized.convertTo((*input_channels)[0], CV_32FC1);
-//  }
-//
-//  /* This operation will write the separate BGR planes directly to the
-//   * input layer of the network because it is wrapped by the cv::Mat
-//   * objects in input_channels. */
-//}
-//
-//void Preprocess(const std::vector<cv::Mat>& imgs,
-//                            std::vector<std::vector<cv::Mat>>& input_channels_batch) {
-//  for(size_t i=0; i<input_channels_batch.size(); ++i) {
-//      Preprocess(imgs[i],&input_channels_batch[i]);
-//  }
-//}
-//
-//paddle_matrix getImageData(char** argv)
-//{
-//  cv::Mat image = cv::imread(argv[1], CV_LOAD_IMAGE_COLOR );
-//
-//  if (image.data == nullptr) {
-//    printf("ERROR: Image: %s was not read\n",argv[1]);    
-//    exit(-1);
-//  }
-//
-//  std::vector<std::vector<cv::Mat>> obrazki;
-//  paddle_matrix mat;
-//
-//  mat = paddle_matrix_create( 1, input_width*input_height*input_num_channels,  false);
-//  // Wrap mat data with vector of cv::Mats
-//  wrapInputLayerBatch(mat, &obrazki, input_num_channels, input_height, input_width);
-//
-//paddle_real* input_data;
-//CHECK(paddle_matrix_get_row(mat, 0, &input_data));
-//
-//  Preprocess({image}, obrazki);
-//
-//CHECK(paddle_matrix_get_row(mat, 0, &input_data));
-//
-//  cv::Mat tescik = obrazki[0][0];
-//  printf("sss\n");
-//
-//  return mat;
-//}
-//
-//
-//paddle_matrix prepareData(int mode, char** argv)
-//{
-//
-//  // Random data mode
-//  if(mode == 1) {
-//    // Create input matrix.
-//    paddle_matrix mat;
-//    //makeRandomData(mat);
-//    makeIncrementalData(mat);
-//    //makeFixedData(mat,1.0f);
-//    return mat;
-//  }
-//
-//  // Image classification mode
-//  if(mode == 2) {
-//    return getImageData(argv);
-//  }
-//}
-//
-//
-//// Read lines of file with names of categories and print
-//void printCategoryName(uint64_t idx_to_print, float prob)  
-//{
-//  std::ifstream ifs;
-//  ifs.open("./synset_words.txt");
-//
-//  // If there is no /proc/cpuinfo fallback to default scheduler
-//  if(ifs.good() == false) {
-//      std::cout << "Error reading synset_words.txt file" << std::endl;
-//      return;   
-//  }
-//  std::string cpuinfo_content((std::istreambuf_iterator<char>(ifs)), std::istreambuf_iterator<char>());
-//  std::stringstream cpuinfo_stream(cpuinfo_content);
-//  std::string category_line;
-//  std::string cpu_name;
-//  int curr_idx = 0;
-//  while(std::getline(cpuinfo_stream, category_line,'\n')){
-//    if (curr_idx == idx_to_print) {
-//      std::cout << "Top1: " << prob <<" "<< category_line << std::endl; 
-//    }
-//    ++curr_idx;
-//  }
-//}
+void fill_data(std::unique_ptr<float[]>& data, unsigned int count)
+{
+  for (unsigned int i = 0; i< count; ++i) {
+    *(data.get() + i) = i;
+  }
+}
 
 
 int main(int argc, char** argv) {
 #ifndef GFLAGS_GFLAGS_H_
   namespace gflags = google;
 #endif
-  gflags::ParseCommandLineFlags(&argc, &argv, true);
+  google::ParseCommandLineFlags(&argc, &argv, true);
   if (FLAGS_modeldir.empty()) {
     // Example:
     std::cout << "Error: Directory with Model not specified. Example of running: ./test_paddle_fluid --modeldir=path/to/your/model" << std::endl;
     exit(1);
   }
 
-  // 1. Define place, executor, scope
-  auto place = paddle::platform::CPUPlace();
-  paddle::framework::InitDevices(false);
-  std::unique_ptr<paddle::framework::Executor> executor(new paddle::framework::Executor(place));
-  std::unique_ptr<paddle::framework::Scope> scope(new paddle::framework::Scope());
+  nn_hardware_platform machine;
+  platform_info pi;
+  machine.get_platform_info(pi);
 
-  std::cout << "Model Directory: " << FLAGS_modeldir << std::endl;
-  std::string dirname = FLAGS_modeldir;
+  paddle::NativeConfig config;
+  config.param_file = FLAGS_modeldir + "/resent50-params";
+  config.prog_file = FLAGS_modeldir + "/__model__";
+  config.use_gpu = false;
+  config.device = 0;
 
-  // 2. Initialize inference program
-  auto inference_program = paddle::inference::Load(executor.get(), scope.get(), dirname);
-  
-  // 3. Get the feed_target_names and fetch_target_names
-  const std::vector<std::string>& feed_target_names =
-      inference_program->GetFeedTargetNames();
-  const std::vector<std::string>& fetch_target_names =
-      inference_program->GetFetchTargetNames();
-  
-  // 4. Generate input
-  paddle::framework::LoDTensor input;
-  srand(time(0));
-  float* input_ptr =
-      input.mutable_data<float>({1, 3,224,224}, paddle::platform::CPUPlace());
-      //input.mutable_data<float>({1, 784}, paddle::platform::CPUPlace());
-  for (int i = 0; i < 3*224*224; ++i) {
-  //for (int i = 0; i < 784; ++i) {
-    input_ptr[i] = rand() / (static_cast<float>(RAND_MAX));
-  }
+  auto predictor =
+      paddle::CreatePaddlePredictor<paddle::NativeConfig, paddle::PaddleEngineKind::kNative>(config);
 
-  std::vector<paddle::framework::LoDTensor> feeds;
-  feeds.push_back(input);
-  //feeds.push_back(input_label);
-  std::vector<paddle::framework::LoDTensor> fetchs;
 
-  // Set up maps for feed and fetch targets
-  std::map<std::string, const paddle::framework::LoDTensor*> feed_targets;
-  std::map<std::string, paddle::framework::LoDTensor*> fetch_targets;
+  std::vector<int> shape;
+  shape.push_back(FLAGS_batch_size);
+  shape.push_back(FLAGS_channels);
+  shape.push_back(FLAGS_height);
+  shape.push_back(FLAGS_width);
 
-  // set_feed_variable
-  for (size_t i = 0; i < feed_target_names.size(); ++i) {
-    feed_targets[feed_target_names[i]] = &feeds[i];
-  }
-
-  // get_fetch_variable
-  fetchs.resize(fetch_target_names.size());
-  for (size_t i = 0; i < fetch_target_names.size(); ++i) {
-    fetch_targets[fetch_target_names[i]] = &fetchs[i];
-  }
-
-  // Run the inference program
-  executor->Run(*inference_program, &*scope, &feed_targets, &fetch_targets);
-
-  // Get outputs
-  for (size_t i = 0; i < fetchs.size(); ++i) {
-    auto dims_i = fetchs[i].dims();
-    std::cout << "dims_i:";
-    for (int j = 0; j < dims_i.size(); ++j) {
-      std::cout << " " << dims_i[j];
+  auto count = [](std::vector<int>& shapevec)
+  {
+    auto sum = shapevec.size() > 0 ? 1 : 0;
+    for (unsigned int i=0; i < shapevec.size(); ++i) {
+      sum *= shapevec[i];
     }
-    std::cout << std::endl;
-    std::cout << "result:";
-    float* output_ptr = fetchs[i].data<float>();
-    for (int j = 0; j < paddle::framework::product(dims_i); ++j) {
-      std::cout << " " << output_ptr[j] << std::endl;
-    }
-    std::cout << std::endl;
+    return sum;
+  }; 
+  
+  std::unique_ptr<float[]> data(new float[count(shape)]);
+  fill_data(data, count(shape));
+
+  // Inference.
+  paddle::PaddleTensor input{
+      .name = "xx",
+      .shape = shape,
+      .data = paddle::PaddleBuf(data.get(), count(shape)*sizeof(float)),
+      .dtype = paddle::PaddleDType::FLOAT32};
+
+  std::vector<paddle::PaddleTensor> output;
+
+  auto t1 = __rdtsc();
+  for (int i =0; i<FLAGS_iterations; ++i) {
+    predictor->Run({input}, &output);
   }
+  auto t2 = __rdtsc();
+
+  std::cout << "---> " << "Inference" << " on average takes " << (t2 -t1)*1000.0f/((float)pi.tsc*FLAGS_iterations) << " ms" << " Throughput: " << shape[0]/((t2 -t1)/((float)pi.tsc*FLAGS_iterations)) << " Images/sec";
+
+  std::cout << std::endl;
+
+
+  auto& tensor = output.front();
+
   return 0;
 }
