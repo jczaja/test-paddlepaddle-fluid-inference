@@ -42,6 +42,8 @@ find_library(PADDLE_INFERENCE_LIBRARY
 include_directories($ENV{PADDLEROOT}/third_party/install/protobuf/include)
 include_directories("$ENV{PADDLEROOT}/third_party/install/gflags/include")
 
+# Threading
+find_package(Threads REQUIRED)
 
 #OpenCV
 find_package( OpenCV REQUIRED )
@@ -60,6 +62,7 @@ target_link_libraries(test-paddle-fluid
 ${PADDLE_LIBRARY}
 ${PADDLE_INFERENCE_LIBRARY}
 ${OpenCV_LIBS}
+${CMAKE_THREAD_LIBS_INIT}
 $ENV{PADDLEROOT}/third_party/install/mklml/lib/libmklml_intel.so
 $ENV{PADDLEROOT}/third_party/install/protobuf/lib/libprotobuf.a
 $ENV{PADDLEROOT}/third_party/install/gflags/lib/libgflags.a

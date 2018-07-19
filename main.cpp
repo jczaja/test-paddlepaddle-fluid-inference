@@ -191,6 +191,13 @@ int main(int argc, char** argv) {
   shape.push_back(FLAGS_height);
   shape.push_back(FLAGS_width);
 
+  std::cout << std::endl << "Executing model: " << FLAGS_modeldir << std::endl <<
+  "Batch Size: " << FLAGS_batch_size << std::endl <<
+  "Channles: " << FLAGS_channels << std::endl <<
+  "Height: " << FLAGS_height << std::endl <<
+  "Width: " << FLAGS_width << std::endl;
+
+
   auto count = [](std::vector<int>& shapevec)
   {
     auto sum = shapevec.size() > 0 ? 1 : 0;
