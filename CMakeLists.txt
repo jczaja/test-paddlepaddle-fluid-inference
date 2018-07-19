@@ -59,10 +59,11 @@ set(CMAKE_EXE_LINKER_FLAGS -Wl,-rpath,/usr/local/lib64)
 add_definitions(-Wall)
 
 target_link_libraries(test-paddle-fluid
-${PADDLE_LIBRARY}
 ${PADDLE_INFERENCE_LIBRARY}
+${PADDLE_LIBRARY}
 ${OpenCV_LIBS}
 ${CMAKE_THREAD_LIBS_INIT}
+-lpthread
 $ENV{PADDLEROOT}/third_party/install/mklml/lib/libmklml_intel.so
 $ENV{PADDLEROOT}/third_party/install/protobuf/lib/libprotobuf.a
 $ENV{PADDLEROOT}/third_party/install/gflags/lib/libgflags.a

@@ -193,7 +193,7 @@ int main(int argc, char** argv) {
 
   std::cout << std::endl << "Executing model: " << FLAGS_modeldir << std::endl <<
   "Batch Size: " << FLAGS_batch_size << std::endl <<
-  "Channles: " << FLAGS_channels << std::endl <<
+  "Channels: " << FLAGS_channels << std::endl <<
   "Height: " << FLAGS_height << std::endl <<
   "Width: " << FLAGS_width << std::endl;
 
